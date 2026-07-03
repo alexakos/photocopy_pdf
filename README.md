@@ -14,9 +14,32 @@ the script and run:
 pip install -r requirements.txt
 ```
 
-This installs the three tools the script needs: `opencv-python-headless`
-(image processing), `numpy` (number crunching for images), and `pillow`
-(saving the final PDF).
+This installs the tools the script needs: `opencv-python-headless`
+(image processing), `numpy` (number crunching for images), `pillow`
+(saving the final PDF), and `pytesseract` (reads text on the page to
+figure out which way is "up").
+
+**For the best rotation results**, also install Tesseract OCR itself —
+`pytesseract` is just a thin wrapper around it, so it won't work without it:
+
+- **Ubuntu/Debian:** `sudo apt-get install tesseract-ocr`
+- **macOS:** `brew install tesseract`
+- **Windows:** install from https://github.com/UB-Mannheim/tesseract/wiki
+
+  On Windows, the installer often does **not** add Tesseract to your PATH
+  automatically, so the script may still say "tesseract not installed"
+  even after installing it. If that happens, add it manually:
+  1. Note where it was installed (usually `C:\Program Files\Tesseract-OCR`)
+  2. Start menu → search "Edit the system environment variables" → open it
+  3. Click **Environment Variables**
+  4. Under **System variables**, select `Path` → **Edit** → **New**
+  5. Paste the folder path from step 1 → **OK** on all windows
+  6. **Close and reopen your terminal** (already-open terminals won't see the change)
+  7. Check it worked by running `tesseract --version` — it should print a version number
+
+If you skip this, the script still runs — it just falls back to guessing
+rotation from the page's width vs. height, which can't tell if a page is
+upside-down (only whether it's sideways).
 
 ## 2. Run it
 
@@ -85,10 +108,20 @@ much, or picking the wrong edges), add this flag to just use the photo
 as-is.
 
 ### `--no-rotate`
-**Turns off automatic upright-rotation.** By default, if a page comes
-out wider than it is tall, the script rotates it to portrait. If you're
-scanning something that's genuinely meant to be landscape (like a wide
-table or certificate), add this flag to keep it as-is.
+**Turns off automatic upright-rotation.** By default, the script reads
+the text on the page to figure out which way is up, and rotates the
+page so it's the right way round — even fixing pages that are sideways
+or completely upside-down. Add this flag if you'd rather it left every
+page exactly as photographed.
+
+### `--rotation-confidence 1.0`
+**How sure the rotation check needs to be before trusting it.** The
+script reads the text to judge orientation; this number is how
+confident it must be before acting on that reading.
+- Lower it (e.g. `0.5`) if correct rotations are being skipped
+- Raise it (e.g. `2.0`) if it's rotating pages incorrectly
+- If it's not confident enough (or Tesseract isn't installed), it falls
+  back to a simpler guess based on whether the page is wider than it is tall
 
 ### `--dpi 300`
 **How much detail/resolution to save in the PDF.** 300 is a standard,
@@ -96,7 +129,27 @@ good-quality scan resolution. You generally don't need to change this,
 but you could lower it (e.g. `150`) for smaller file sizes, or raise it
 (e.g. `600`) if you need to zoom in a lot on the final PDF.
 
-## 4. Examples
+## 4. Reading the output
+
+While it runs, the script prints a line per photo telling you whether it
+actually used text-reading (Tesseract) to fix the rotation, or fell back
+to the basic guess — and why, if so:
+
+```
+→ receipt1.jpg: Tesseract used, rotated 90° (confidence 4.12)
+→ receipt2.jpg: Tesseract used, page already upright (confidence 3.05)
+→ receipt3.jpg: Tesseract NOT used (tesseract not installed), falling back to basic width-vs-height rotation
+→ receipt4.jpg: Tesseract NOT used (confidence too low (0.62 < 1.00)), falling back to basic width-vs-height rotation
+→ receipt5.jpg: Tesseract NOT used (no text found on page), falling back to basic width-vs-height rotation
+```
+
+Common reasons Tesseract might not be used for a given page:
+- **"tesseract not installed"** — the OCR engine isn't set up (see step 1)
+- **"no text found on page"** — the photo has too little/no readable text (e.g. a photo, a mostly blank page)
+- **"confidence too low"** — Tesseract read the page but wasn't sure enough about the orientation; lower `--rotation-confidence` to accept these
+- **"OCR failed (...)"** — Tesseract hit an error reading this specific image
+
+## 5. Examples
 
 Default settings (recommended starting point):
 ```
@@ -118,12 +171,12 @@ Photos where the auto-crop keeps getting it wrong:
 python photocopy_pdf.py -i ./my_photos -o ./my_pdfs --no-perspective
 ```
 
-## 5. If something looks off
+## 6. If something looks off
 
 | Problem | Try this |
 |---|---|
 | Background looks gray, not white | `--mode bw` and raise `--c`, or in grayscale mode raise `--contrast` / `--brightness` |
 | Text is too faint / thin | Lower `--contrast` a bit, or raise `--brightness` |
 | Page got cropped wrong | Add `--no-perspective` |
-| Page is sideways | Should auto-rotate; if it's still wrong, check `--no-rotate` isn't set |
+| Page is sideways or upside-down | Should auto-correct if Tesseract OCR is installed; otherwise install it (see step 1) — without it, upside-down pages can't be detected |
 | Photo is grainy/noisy | Add `--denoise` |

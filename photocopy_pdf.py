@@ -21,7 +21,23 @@ Optional tuning:
     --denoise          Apply denoising before conversion (slower, cleans up phone noise)
     --dpi 300          DPI written into the output PDF (affects perceived print size)
     --no-perspective   Skip automatic page-edge detection / deskewing
-    --no-rotate        Skip automatic rotation of landscape pages to portrait
+    --no-rotate        Skip automatic rotation to upright
+    --rotation-confidence 1.0
+                       How sure the text-reading rotation check must be
+                       before trusting it (lower = trust it more often,
+                       higher = fall back to the basic guess more often)
+
+Note: for the most reliable rotation (including fixing upside-down
+pages), install Tesseract OCR on your system:
+    Ubuntu/Debian: sudo apt-get install tesseract-ocr
+    macOS:         brew install tesseract
+    Windows:       https://github.com/UB-Mannheim/tesseract/wiki
+Without it, rotation falls back to a simpler width-vs-height guess that
+can fix sideways pages but not upside-down ones.
+
+For every page, the script prints whether Tesseract was actually used
+for rotation, and if not, why (not installed, low confidence, no text
+found, etc.).
 
 Requirements:
     pip install opencv-python-headless numpy pillow
@@ -34,6 +50,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PIL import Image
+
+try:
+    import pytesseract
+    HAS_TESSERACT = True
+except ImportError:
+    HAS_TESSERACT = False
 
 VALID_EXTS = {".jpg", ".jpeg"}
 
@@ -167,17 +189,98 @@ def make_grayscale_photocopy(img_bgr: np.ndarray, denoise: bool, contrast: float
     return sharpened
 
 
+def detect_text_rotation(img_bgr: np.ndarray, min_confidence: float):
+    """
+    Ask Tesseract OCR which way the text is actually oriented in the image.
+
+    Returns a dict with:
+      - "angle": clockwise angle (0, 90, 180, or 270) needed to make the
+        text upright, or None if it couldn't be determined
+      - "confidence": Tesseract's confidence score in that reading (0 if unknown)
+      - "used": True if this reading should be trusted and used
+      - "reason": short explanation, mainly relevant when "used" is False
+    """
+    if not HAS_TESSERACT:
+        return {"angle": None, "confidence": 0.0, "used": False, "reason": "tesseract not installed"}
+
+    try:
+        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb)
+        osd = pytesseract.image_to_osd(pil_img)
+    except Exception as exc:
+        # Covers "tesseract binary missing/broken", unreadable/blank page, etc.
+        return {"angle": None, "confidence": 0.0, "used": False, "reason": f"OCR failed ({exc})"}
+
+    angle = None
+    confidence = 0.0
+    for line in osd.splitlines():
+        if line.startswith("Rotate:"):
+            angle = int(line.split(":")[1].strip())
+        elif line.startswith("Orientation confidence:"):
+            confidence = float(line.split(":")[1].strip())
+
+    if angle is None:
+        return {"angle": None, "confidence": confidence, "used": False, "reason": "no text found on page"}
+
+    if confidence < min_confidence:
+        return {
+            "angle": angle,
+            "confidence": confidence,
+            "used": False,
+            "reason": f"confidence too low ({confidence:.2f} < {min_confidence:.2f})",
+        }
+
+    return {"angle": angle, "confidence": confidence, "used": True, "reason": "ok"}
+
+
+def rotate_by_angle(img_bgr: np.ndarray, angle: int) -> np.ndarray:
+    """Rotate an image clockwise by 0, 90, 180, or 270 degrees."""
+    if angle == 90:
+        return cv2.rotate(img_bgr, cv2.ROTATE_90_CLOCKWISE)
+    if angle == 180:
+        return cv2.rotate(img_bgr, cv2.ROTATE_180)
+    if angle == 270:
+        return cv2.rotate(img_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return img_bgr
+
+
 def rotate_to_portrait(img_bgr: np.ndarray) -> np.ndarray:
-    """If the image is wider than it is tall, rotate it 90° so it's portrait."""
+    """If the image is wider than it is tall, rotate it 90° so it's portrait.
+    This is a fallback used when text orientation can't be detected -
+    it guesses based on shape alone, so it can't fix upside-down pages."""
     h, w = img_bgr.shape[:2]
     if w > h:
         return cv2.rotate(img_bgr, cv2.ROTATE_90_CLOCKWISE)
     return img_bgr
 
 
+def auto_orient(img_bgr: np.ndarray, min_confidence: float, path_name: str) -> np.ndarray:
+    """
+    Figure out the correct upright orientation and rotate to it.
+    Prefers reading the actual text direction (handles sideways AND
+    upside-down pages correctly); falls back to a width-vs-height guess
+    if OCR isn't available or isn't confident about this page.
+    Prints a status line explaining what happened.
+    """
+    result = detect_text_rotation(img_bgr, min_confidence=min_confidence)
+
+    if result["used"]:
+        if result["angle"] == 0:
+            print(f"  → {path_name}: Tesseract used, page already upright "
+                  f"(confidence {result['confidence']:.2f})")
+        else:
+            print(f"  → {path_name}: Tesseract used, rotated {result['angle']}° "
+                  f"(confidence {result['confidence']:.2f})")
+        return rotate_by_angle(img_bgr, result["angle"])
+
+    print(f"  → {path_name}: Tesseract NOT used ({result['reason']}), "
+          f"falling back to basic width-vs-height rotation")
+    return rotate_to_portrait(img_bgr)
+
+
 def process_folder(input_dir: Path, output_dir: Path, mode: str, block_size: int, c: int,
                     contrast: float, brightness: int, denoise: bool, dpi: int,
-                    perspective: bool, auto_rotate: bool) -> None:
+                    perspective: bool, auto_rotate: bool, rotation_confidence: float) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     files = sorted(
@@ -203,7 +306,7 @@ def process_folder(input_dir: Path, output_dir: Path, mode: str, block_size: int
                 print(f"  i {path.name}: no clear page edges found, using original framing")
 
         if auto_rotate:
-            img_bgr = rotate_to_portrait(img_bgr)
+            img_bgr = auto_orient(img_bgr, min_confidence=rotation_confidence, path_name=path.name)
 
         if mode == "bw":
             result = make_bw_photocopy(img_bgr, block_size=block_size, c=c, denoise=denoise)
@@ -232,7 +335,9 @@ def main():
     parser.add_argument("--denoise", action="store_true", help="Apply denoising before conversion")
     parser.add_argument("--dpi", type=int, default=300, help="DPI to embed in output PDF (default 300)")
     parser.add_argument("--no-perspective", action="store_true", help="Skip automatic page-edge detection / deskewing")
-    parser.add_argument("--no-rotate", action="store_true", help="Skip automatic rotation of landscape pages to portrait")
+    parser.add_argument("--no-rotate", action="store_true", help="Skip automatic rotation to upright")
+    parser.add_argument("--rotation-confidence", type=float, default=1.0,
+                         help="Minimum confidence to trust text-based rotation detection (default 1.0)")
     args = parser.parse_args()
 
     input_dir = Path(args.input).expanduser().resolve()
@@ -254,6 +359,7 @@ def main():
         dpi=args.dpi,
         perspective=not args.no_perspective,
         auto_rotate=not args.no_rotate,
+        rotation_confidence=args.rotation_confidence,
     )
 
 
